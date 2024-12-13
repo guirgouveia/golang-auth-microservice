@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"time"
 
@@ -57,18 +56,16 @@ func New() http.Handler {
 	}
 
 	r := mux.NewRouter()
-
-	// Public routes
-	r.HandleFunc("/login", h.logRequest(h.loginHandler())).Methods("POST")
+	r.HandleFunc("/logout", h.logRequest(h.logoutHandler())).Methods("GET")
 	r.HandleFunc("/signup", h.logRequest(h.signUpHandler())).Methods("POST")
-	r.HandleFunc("/login/google", h.logRequest(h.googleLoginHandler())).Methods("GET")
-	r.HandleFunc("/login/google/callback", h.logRequest(h.googleCallbackHandler())).Methods("GET")
+	r.HandleFunc("/console", h.logRequest(h.homeHandler())).Methods("GET")
 
 	// Protected routes
-	protected := r.PathPrefix("/api").Subrouter()
-	protected.Use(h.sm.SessionMiddleware)
-	protected.HandleFunc("/logout", h.logRequest(h.logoutHandler())).Methods("POST")
-	protected.HandleFunc("/console", h.logRequest(h.homeHandler())).Methods("GET")
+	login := r.PathPrefix("/login").Subrouter()
+	login.Use(h.sm.SessionMiddleware)
+	login.HandleFunc("", h.logRequest(h.loginHandler())).Methods("GET")
+	login.HandleFunc("/google", h.logRequest(h.googleLoginHandler())).Methods("GET")
+	login.HandleFunc("/google/callback", h.logRequest(h.googleCallbackHandler())).Methods("GET")
 
 	return r
 }
@@ -94,7 +91,10 @@ func NewSessionManager() *SessionManager {
 // Middleware to log requests
 func (h *Handler) logRequest(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s", r.Method, r.URL.Path)
+		h.sm.logger.WithFields(logrus.Fields{
+			"method": r.Method,
+			"path":   r.URL.Path,
+		}).Info("Request received")
 		next.ServeHTTP(w, r)
 	}
 }
@@ -102,12 +102,8 @@ func (h *Handler) logRequest(next http.HandlerFunc) http.HandlerFunc {
 // Home handler for protected routes
 func (h *Handler) homeHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		user, err := GetUserFromContext(r.Context())
-		if err != nil {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-		w.Write([]byte(fmt.Sprintf("Welcome %s!", user.Name)))
+
+		w.Write([]byte("Welcome"))
 	}
 }
 
@@ -116,9 +112,14 @@ func (h *Handler) loginHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var creds models.Credentials
 		if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-			h.sm.logger.WithError(err).Error("Failed to decode credentials")
-			http.Error(w, "Invalid request", http.StatusBadRequest)
-			return
+			// Try to get the parameters from the URL
+			creds.Email = r.URL.Query().Get("email")
+			creds.Password = r.URL.Query().Get("password")
+			if creds.Email == "" || creds.Password == "" {
+				h.sm.logger.WithError(err).Error("Failed to decode credentials")
+				http.Error(w, "Invalid request", http.StatusBadRequest)
+				return
+			}
 		}
 
 		user, exists := h.sm.users[creds.Email]
@@ -179,7 +180,7 @@ func (h *Handler) signUpHandler() http.HandlerFunc {
 // LogoutHandler clears the user session
 func (h *Handler) logoutHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("session_token")
+		cookie, err := r.Cookie("maloka_session_token")
 		if err != nil {
 			http.Error(w, "No session found", http.StatusBadRequest)
 			return
@@ -188,7 +189,7 @@ func (h *Handler) logoutHandler() http.HandlerFunc {
 		delete(h.sm.sessions, cookie.Value)
 
 		http.SetCookie(w, &http.Cookie{
-			Name:     "session_token",
+			Name:     "maloka_session_token",
 			Value:    "",
 			Path:     "/",
 			MaxAge:   -1,
@@ -215,7 +216,7 @@ func (sm *SessionManager) generateJWTToken(user models.User) (string, error) {
 // Set the session cookie
 func (sm *SessionManager) setSessionCookie(w http.ResponseWriter, token string) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     "session_token",
+		Name:     "maloka_session_token",
 		Value:    token,
 		Path:     "/",
 		MaxAge:   int(12 * time.Hour.Seconds()),
@@ -299,37 +300,46 @@ func (h *Handler) googleCallbackHandler() http.HandlerFunc {
 	}
 }
 
-// Add missing SessionMiddleware implementation:
 func (sm *SessionManager) SessionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("session_token")
 		if err != nil {
-			sm.logger.WithError(err).Warn("No session cookie")
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			// If no session token exists, allow the request to proceed
+			next.ServeHTTP(w, r)
 			return
 		}
 
 		claims, err := sm.validateToken(cookie.Value)
 		if err != nil {
+			// If the token is invalid, allow the request to proceed
 			sm.logger.WithError(err).Warn("Invalid token")
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			next.ServeHTTP(w, r)
 			return
 		}
 
 		email, ok := claims["email"].(string)
 		if !ok {
+			// If the token doesn't contain the email claim, allow the request to proceed
 			sm.logger.Warn("Email claim missing")
-			http.Error(w, "Invalid token", http.StatusUnauthorized)
+			next.ServeHTTP(w, r)
 			return
 		}
 
 		user, exists := sm.users[email]
 		if !exists {
+			// If the user doesn't exist, allow the request to proceed
 			sm.logger.WithField("email", email).Warn("User not found")
-			http.Error(w, "User not found", http.StatusUnauthorized)
+			next.ServeHTTP(w, r)
 			return
 		}
 
+		// Redirect authenticated users to /console if they try to access public routes
+		if r.URL.Path == "/login" || r.URL.Path == "/login/google" || r.URL.Path == "/login/google/callback" {
+			http.Redirect(w, r, "/console", http.StatusTemporaryRedirect)
+			return
+		}
+
+		// Add the user to the request context and allow the request to proceed
 		ctx := context.WithValue(r.Context(), CtxUserKey, user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -357,10 +367,15 @@ func (sm *SessionManager) handleGoogleUser(userInfo *models.GoogleUserInfo) (mod
 	user, exists := sm.users[userInfo.Email]
 	if !exists {
 		user = models.User{
-			Email: userInfo.Email,
-			Name:  userInfo.Name,
+			ID:            userInfo.Email,
+			Email:         userInfo.Email,
+			Name:          userInfo.Name,
+			Password:      "",
+			VerifiedEmail: userInfo.VerifiedEmail,
 		}
-		sm.users[user.Email] = user
+		if err := sm.CreateUser(user); err != nil {
+			return models.User{}, "", fmt.Errorf("creating user: %w", err)
+		}
 	}
 
 	token, err := sm.generateJWTToken(user)
@@ -370,4 +385,19 @@ func (sm *SessionManager) handleGoogleUser(userInfo *models.GoogleUserInfo) (mod
 
 	sm.sessions[token] = user.Email
 	return user, token, nil
+}
+
+// CreateUser creates a new user and stores it in the session manager
+func (sm *SessionManager) CreateUser(newUser models.User) error {
+
+	if newUser.Password != "" {
+		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.Password), bcrypt.DefaultCost)
+		if err != nil {
+			return fmt.Errorf("failed to hash password: %w", err)
+		}
+		newUser.Password = string(hashedPassword)
+	}
+
+	sm.users[newUser.Email] = newUser
+	return nil
 }
