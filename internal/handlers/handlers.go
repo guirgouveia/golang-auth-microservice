@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"google-sso-golang/internal/config"
@@ -45,6 +46,80 @@ type Handler struct {
 	sm *SessionManager
 }
 
+// handleSignup - GET (form) or POST (register)
+func (h *Handler) signUpHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			// Show a signup form
+			html := `<html>
+				<head><title>Sign Up</title></head>
+				<body>
+					<h1>Sign Up</h1>
+					<form method="POST" action="/signup">
+						<label>Email:</label><br>
+						<input type="email" name="email" required><br><br>
+						<label>Password:</label><br>
+						<input type="password" name="password" required><br><br>
+						<button type="submit">Sign Up</button>
+					</form>
+				</body>
+				</html>`
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, html)
+			return
+
+		case http.MethodPost:
+			email := r.FormValue("email")
+			password := r.FormValue("password")
+
+			if email == "" || password == "" {
+				http.Error(w, "Invalid email or password", http.StatusBadRequest)
+				return
+			}
+
+			// Check if user already exists
+			if _, exists := h.sm.users[strings.ToLower(email)]; exists {
+				http.Error(w, "User already exists", http.StatusConflict)
+				return
+			}
+
+			// Hash the password
+			hashedPass, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			if err != nil {
+				http.Error(w, "Failed to hash password", http.StatusInternalServerError)
+				return
+			}
+
+			// Create new user
+			h.sm.users[strings.ToLower(email)] = models.User{
+				Email:        strings.ToLower(email),
+				PasswordHash: string(hashedPass),
+			}
+
+			http.Redirect(w, r, "/auth/login", http.StatusSeeOther)
+			return
+
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+func (h *Handler) indexHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		html := `<html>
+	<head><title>Golang Auth Service</title></head>
+	<body>
+		<h1>Golang Auth (JWT + Google OAuth2)</h1>
+		<p><a href="/login">Local Login</a> | <a href="/signup">Signup</a> | <a href="/auth/login/google">Login with Google</a></p>
+	</body>
+	</html>`
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, html)
+	}
+}
+
 // Initialize the global configuration variable
 func init() {
 	cfg = config.Load()
@@ -59,8 +134,9 @@ func New() http.Handler {
 	}
 
 	r := mux.NewRouter()
+	r.HandleFunc("/", h.logRequest(h.indexHandler())).Methods("GET")
 	r.HandleFunc("/logout", h.logRequest(h.logoutHandler())).Methods("GET")
-	r.HandleFunc("/signup", h.logRequest(h.signUpHandler())).Methods("POST")
+	r.HandleFunc("/signup", h.logRequest(h.signUpHandler())).Methods("GET", "POST")
 	r.HandleFunc("/console", h.logRequest(h.consoleHandler())).Methods("GET")
 
 	// Protected routes
@@ -123,7 +199,7 @@ func (h *Handler) consoleHandler() http.HandlerFunc {
 			return
 		}
 
-		w.Write([]byte(fmt.Sprintf("Welcome, %s!", user.Email)))
+		w.Write([]byte(fmt.Sprintf("Welcome, %s!", user.Name)))
 	}
 }
 
@@ -135,7 +211,7 @@ func (h *Handler) loginHandler() http.HandlerFunc {
 		creds.Email = r.FormValue("username")
 		creds.Password = r.FormValue("password")
 		if creds.Email == "" || creds.Password == "" {
-			h.sm.logger.WithError(errors.New("Failed to decode credentials"))
+			h.sm.logger.WithError(errors.New("failed to decode credentials"))
 			http.Error(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
@@ -164,36 +240,36 @@ func (h *Handler) loginHandler() http.HandlerFunc {
 	}
 }
 
-// SignUpHandler registers a new user
-func (h *Handler) signUpHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var newUser models.User
-		if err := json.NewDecoder(r.Body).Decode(&newUser); err != nil {
-			h.sm.logger.WithError(err).Error("Failed to decode user data")
-			http.Error(w, "Invalid request", http.StatusBadRequest)
-			return
-		}
+// // SignUpHandler registers a new user
+// func (h *Handler) signUpHandler() http.HandlerFunc {
+// 	return func(w http.ResponseWriter, r *http.Request) {
+// 		var newUser models.User
+// 		if err := json.NewDecoder(r.Body).Decode(&newUser); err != nil {
+// 			h.sm.logger.WithError(err).Error("Failed to decode user data")
+// 			http.Error(w, "Invalid request", http.StatusBadRequest)
+// 			return
+// 		}
 
-		if _, exists := h.sm.users[newUser.Email]; exists {
-			h.sm.logger.WithField("email", newUser.Email).Warn("Email already exists")
-			http.Error(w, "Email already registered", http.StatusConflict)
-			return
-		}
+// 		if _, exists := h.sm.users[newUser.Email]; exists {
+// 			h.sm.logger.WithField("email", newUser.Email).Warn("Email already exists")
+// 			http.Error(w, "Email already registered", http.StatusConflict)
+// 			return
+// 		}
 
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.PasswordHash), bcrypt.DefaultCost)
-		if err != nil {
-			h.sm.logger.WithError(err).Error("Failed to hash password")
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
+// 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.PasswordHash), bcrypt.DefaultCost)
+// 		if err != nil {
+// 			h.sm.logger.WithError(err).Error("Failed to hash password")
+// 			http.Error(w, "Internal server error", http.StatusInternalServerError)
+// 			return
+// 		}
 
-		newUser.PasswordHash = string(hashedPassword)
-		h.sm.users[newUser.Email] = newUser
+// 		newUser.PasswordHash = string(hashedPassword)
+// 		h.sm.users[newUser.Email] = newUser
 
-		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(newUser)
-	}
-}
+// 		w.WriteHeader(http.StatusCreated)
+// 		json.NewEncoder(w).Encode(newUser)
+// 	}
+// }
 
 // LogoutHandler clears the user session
 func (h *Handler) logoutHandler() http.HandlerFunc {
