@@ -1,17 +1,21 @@
 package models
 
 type User struct {
-	ID            string `json:"id"`
+	Username      string `json:"id"`
 	Email         string `json:"email"`
 	VerifiedEmail bool   `json:"verified_email"`
 	Name          string `json:"name"`
-	Password      string `json:"-"`
+	PasswordHash  string `json:"-"`
+	CreatedAt     string `json:"creation_date"`
 }
 
 type GoogleUserInfo struct {
 	Email         string `json:"email"`
 	VerifiedEmail bool   `json:"verified_email"`
 	Name          string `json:"name"`
+	GivenName     string `json:"given_name"`
+	FamilyName    string `json:"family_name"`
+	DisplayName   string `json:"display_name"`
 	Picture       string `json:"picture"`
 }
 
