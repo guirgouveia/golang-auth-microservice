@@ -20,3 +20,4 @@ go.work
 # Go module files
 go.sum
 **/.envrc
+.env
