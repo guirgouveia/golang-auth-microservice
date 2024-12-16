@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
       tags:
-        - go/auth
+        - ghcr.io/guirgouveia/google-sso-golang:latest
     container_name: auth
     ports:
       - "8080:8080"

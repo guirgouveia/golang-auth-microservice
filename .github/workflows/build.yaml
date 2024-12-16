@@ -1,0 +1,15 @@
+on:
+    push:
+        branches:
+            - main
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v2
+            - name: Build
+              run: docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/guirgouveia/google-sso-golang:latest .
+            - name: Push
+              run: echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u guirgouveia --password-stdin
