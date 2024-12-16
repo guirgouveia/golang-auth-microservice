@@ -65,7 +65,7 @@ This project demonstrates how to implement Google Single Sign-On (SSO) in a Gola
 1. Start the application using Docker Compose:
 
     ```sh
-    docker-compose up --build
+    docker-compose up -d --build
     ```
 
 2. Open your browser and navigate to `http://localhost:8080`.

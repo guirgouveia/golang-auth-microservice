@@ -118,6 +118,7 @@ func New() *http.ServeMux {
 // -------------------------------------------------------------------
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
+	log.Println("Serving index page")
 	html := `<html>
 	<head><title>Golang Auth (NoSQL & JWT)</title></head>
 	<body>
@@ -137,6 +138,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 func handleSignup(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		log.Println("Serving signup form")
 		html := `<html>
 			<head><title>Sign Up</title></head>
 			<body>
@@ -159,6 +161,7 @@ func handleSignup(w http.ResponseWriter, r *http.Request) {
 		password := r.FormValue("password")
 
 		if email == "" || password == "" {
+			log.Println("Invalid email or password")
 			http.Error(w, "Invalid email or password", http.StatusBadRequest)
 			return
 		}
@@ -171,12 +174,14 @@ func handleSignup(w http.ResponseWriter, r *http.Request) {
 		err := userCollection.FindOne(ctx, bson.M{"email": email}).Decode(&existing)
 		if err == nil {
 			// means user found
+			log.Println("User already exists:", email)
 			http.Error(w, "User already exists", http.StatusConflict)
 			return
 		}
 
 		hashedPass, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if err != nil {
+			log.Println("Failed to hash password:", err)
 			http.Error(w, "Failed to hash password", http.StatusInternalServerError)
 			return
 		}
@@ -188,18 +193,22 @@ func handleSignup(w http.ResponseWriter, r *http.Request) {
 
 		_, err = userCollection.InsertOne(ctx, newUser)
 		if err != nil {
+			log.Println("Failed to create user:", err)
 			http.Error(w, "Failed to create user", http.StatusInternalServerError)
 			return
 		}
 
+		log.Println("User created successfully:", email)
 		http.Redirect(w, r, "/login-form", http.StatusSeeOther)
 	default:
+		log.Println("Method not allowed")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
 // handleLoginForm - GET login form
 func handleLoginForm(w http.ResponseWriter, r *http.Request) {
+	log.Println("Serving login form")
 	html := `<html>
 	<head><title>Login</title></head>
 	<body>
@@ -221,6 +230,7 @@ func handleLoginForm(w http.ResponseWriter, r *http.Request) {
 // handleLogin - POST local login
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		log.Println("Method not allowed")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -229,6 +239,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	password := r.FormValue("password")
 
 	if email == "" || password == "" {
+		log.Println("Invalid email or password")
 		http.Error(w, "Invalid email or password", http.StatusBadRequest)
 		return
 	}
@@ -239,11 +250,13 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	var user User
 	err := userCollection.FindOne(ctx, bson.M{"email": email}).Decode(&user)
 	if err != nil {
+		log.Println("User not found:", email)
 		http.Error(w, "User not found", http.StatusUnauthorized)
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password)); err != nil {
+		log.Println("Incorrect password for user:", email)
 		http.Error(w, "Incorrect password", http.StatusUnauthorized)
 		return
 	}
@@ -251,6 +264,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Generate JWT
 	tokenString, err := createJWTToken(user.Email)
 	if err != nil {
+		log.Println("Failed to create token:", err)
 		http.Error(w, "Failed to create token", http.StatusInternalServerError)
 		return
 	}
@@ -263,11 +277,13 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/",
 		Expires:  time.Now().Add(24 * time.Hour),
 	})
+	log.Println("User logged in successfully:", email)
 	http.Redirect(w, r, "/profile", http.StatusSeeOther)
 }
 
 // handleGoogleLogin - initiates Google OAuth2 login
 func handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
+	log.Println("Initiating Google OAuth2 login")
 	url := googleOauthConfig.AuthCodeURL(oauthStateString, oauth2.AccessTypeOffline)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
@@ -276,18 +292,21 @@ func handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
 func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	state := r.FormValue("state")
 	if state != oauthStateString {
+		log.Println("Invalid OAuth state")
 		http.Error(w, "Invalid OAuth state", http.StatusBadRequest)
 		return
 	}
 
 	code := r.FormValue("code")
 	if code == "" {
+		log.Println("Code not found")
 		http.Error(w, "Code not found", http.StatusBadRequest)
 		return
 	}
 
 	token, err := googleOauthConfig.Exchange(context.Background(), code)
 	if err != nil {
+		log.Println("Failed to exchange code:", err)
 		http.Error(w, "Failed to exchange code: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -295,6 +314,7 @@ func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	client := googleOauthConfig.Client(context.Background(), token)
 	userInfo, err := fetchGoogleUserInfo(client)
 	if err != nil {
+		log.Println("Failed to fetch user info:", err)
 		http.Error(w, "Failed to fetch user info: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -305,10 +325,12 @@ func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.Unmarshal([]byte(userInfo), &googleData); err != nil {
+		log.Println("Failed to parse user info:", err)
 		http.Error(w, "Failed to parse user info", http.StatusInternalServerError)
 		return
 	}
 	if googleData.Email == "" {
+		log.Println("No email found in Google profile")
 		http.Error(w, "No email found in Google profile", http.StatusInternalServerError)
 		return
 	}
@@ -328,19 +350,23 @@ func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		_, err = userCollection.InsertOne(ctx, user)
 		if err != nil {
+			log.Println("Failed to create user:", err)
 			http.Error(w, "Failed to create user", http.StatusInternalServerError)
 			return
 		}
+		log.Println("User created successfully via Google OAuth:", googleData.Email)
 	} else {
 		// If user exists but no GoogleID, update
 		if user.GoogleID == "" {
 			user.GoogleID = googleData.ID
 			_, _ = userCollection.UpdateOne(ctx, bson.M{"_id": user.ID}, bson.M{"$set": bson.M{"googleId": googleData.ID}})
 		}
+		log.Println("User logged in via Google OAuth:", googleData.Email)
 	}
 
 	tokenString, err := createJWTToken(googleData.Email)
 	if err != nil {
+		log.Println("Failed to create token:", err)
 		http.Error(w, "Failed to create token", http.StatusInternalServerError)
 		return
 	}
@@ -366,10 +392,12 @@ func handleProfile(w http.ResponseWriter, r *http.Request) {
 
 	var user User
 	if err := userCollection.FindOne(ctx, bson.M{"email": userEmail}).Decode(&user); err != nil {
+		log.Println("User not found:", userEmail)
 		http.Error(w, "User not found", http.StatusNotFound)
 		return
 	}
 
+	log.Println("Serving profile for user:", userEmail)
 	html := `<html>
 	<head><title>Profile</title></head>
 	<body>
@@ -393,6 +421,7 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 		Expires: time.Unix(0, 0),
 		Path:    "/",
 	})
+	log.Println("User logged out")
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -404,6 +433,7 @@ func jwtMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("jwt_token")
 		if err != nil || cookie.Value == "" {
+			log.Println("JWT token not found, redirecting to login")
 			http.Redirect(w, r, "/login-form", http.StatusSeeOther)
 			return
 		}
@@ -414,11 +444,13 @@ func jwtMiddleware(next http.Handler) http.Handler {
 		})
 
 		if err != nil || !token.Valid {
+			log.Println("Invalid JWT token, redirecting to login")
 			http.Redirect(w, r, "/login-form", http.StatusSeeOther)
 			return
 		}
 
 		if claims.Subject == "" {
+			log.Println("JWT token missing subject, redirecting to login")
 			http.Redirect(w, r, "/login-form", http.StatusSeeOther)
 			return
 		}
