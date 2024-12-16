@@ -1,0 +1,50 @@
+# Git
+.git
+.gitignore
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# Project specific
+tmp/
+build/
+dist/
+vendor/
+
+# Environment and configuration
+.env
+*.env
+.env.*
+config.yaml
+*.local
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Documentation
+docs/
+README.md
+LICENSE
+
+# Docker specific
+Dockerfile
+docker-compose*.yml

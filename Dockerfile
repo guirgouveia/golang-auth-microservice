@@ -18,8 +18,7 @@
     # -------------------------------------------------------------------
     # STAGE 2: Distroless Final
     # -------------------------------------------------------------------
-    FROM --platform=${TARGETPLATFORM} gcr.io/distroless/static:nonroot AS final
-    
+    FROM --platform=${TARGETPLATFORM} gcr.io/distroless/static:nonroot AS final    
     # If your app needs CA certificates, use distroless/base instead or embed them in your Go binary:
     #   FROM gcr.io/distroless/base:nonroot
     #   (Which includes some certs under /etc/ssl/certs)

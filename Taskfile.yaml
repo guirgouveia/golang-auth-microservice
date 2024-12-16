@@ -1,0 +1,12 @@
+version: '3'
+
+tasks:
+  run:
+    desc: "Bring up the Docker Compose services"
+    cmds:
+      - docker-compose up -d
+
+  destroy:
+    desc: "Bring down the Docker Compose services"
+    cmds:
+      - docker-compose down
