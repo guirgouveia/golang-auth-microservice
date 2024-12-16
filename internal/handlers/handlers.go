@@ -2,531 +2,468 @@ package handlers
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
-	"google-sso-golang/internal/config"
-	"google-sso-golang/internal/models"
-
-	"github.com/dgrijalva/jwt-go"
-	"github.com/gorilla/mux"
-	"github.com/sirupsen/logrus"
+	"github.com/golang-jwt/jwt/v4"
+	"github.com/joho/godotenv"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 )
 
-// Global configuration variable
-var cfg *config.Config
+// -------------------------------------------------------------------
+// MODELS
+// -------------------------------------------------------------------
 
-// Custom errors for better error handling
-var (
-	ErrInvalidToken       = errors.New("invalid token")
-	ErrTokenExpired       = errors.New("token expired")
-	ErrInvalidCredentials = errors.New("invalid credentials")
-	ErrUserNotFound       = errors.New("user not found")
-	ErrInvalidSession     = errors.New("invalid session")
-)
-
-// UserContextKey is the key type for context values
-type UserContextKey struct {
-	user string
+type User struct {
+	ID       primitive.ObjectID `bson:"_id,omitempty"`
+	Email    string             `bson:"email"`
+	Password string             `bson:"password"` // hashed password
+	GoogleID string             `bson:"googleId"` // stored if user logs in via Google
 }
 
-var CtxUserKey = &UserContextKey{
-	user: "user",
-}
+// -------------------------------------------------------------------
+// GLOBALS
+// -------------------------------------------------------------------
 
-// Handler structure
-type Handler struct {
-	sm *SessionManager
-}
+// DB & Collection references
+var mongoClient *mongo.Client
+var userCollection *mongo.Collection
 
-// handleSignup - GET (form) or POST (register)
-func (h *Handler) signUpHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			// Show a signup form
-			html := `<html>
-				<head><title>Sign Up</title></head>
-				<body>
-					<h1>Sign Up</h1>
-					<form method="POST" action="/signup">
-						<label>Email:</label><br>
-						<input type="email" name="email" required><br><br>
-						<label>Password:</label><br>
-						<input type="password" name="password" required><br><br>
-						<button type="submit">Sign Up</button>
-					</form>
-				</body>
-				</html>`
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			fmt.Fprint(w, html)
-			return
+var googleOauthConfig *oauth2.Config
+var oauthStateString = generateRandomString(16)
 
-		case http.MethodPost:
-			email := r.FormValue("email")
-			password := r.FormValue("password")
+// For JWT session management
+var jwtSecret = []byte("REPLACE_WITH_A_LONG_SECURE_RANDOM_KEY")
 
-			if email == "" || password == "" {
-				http.Error(w, "Invalid email or password", http.StatusBadRequest)
-				return
-			}
+func init() {
+	// Load environment variables
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Warning: .env file not found. Falling back to environment vars if set.")
+	}
 
-			// Check if user already exists
-			if _, exists := h.sm.users[strings.ToLower(email)]; exists {
-				http.Error(w, "User already exists", http.StatusConflict)
-				return
-			}
+	// Configure MongoDB client
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-			// Hash the password
-			hashedPass, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-			if err != nil {
-				http.Error(w, "Failed to hash password", http.StatusInternalServerError)
-				return
-			}
+	mongoURI := os.Getenv("MONGO_URI") // e.g., "mongodb://localhost:27017"
+	if mongoURI == "" {
+		mongoURI = "mongodb://localhost:27017"
+	}
+	mongoClient, err = mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	if err != nil {
+		log.Fatal("Failed to connect to MongoDB: ", err)
+	}
 
-			// Create new user
-			h.sm.users[strings.ToLower(email)] = models.User{
-				Email:        strings.ToLower(email),
-				PasswordHash: string(hashedPass),
-			}
+	// Create or use an existing database and collection (e.g. "authdb", "users")
+	dbName := os.Getenv("MONGO_DB_NAME")
+	if dbName == "" {
+		dbName = "authdb"
+	}
+	userCollection = mongoClient.Database(dbName).Collection("users")
 
-			http.Redirect(w, r, "/auth/login", http.StatusSeeOther)
-			return
-
-		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
+	// Set up Google OAuth2 config
+	googleOauthConfig = &oauth2.Config{
+		ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+		ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+		RedirectURL:  os.Getenv("GOOGLE_REDIRECT_URL"), // e.g. "http://localhost:8080/auth/google/callback"
+		Scopes: []string{
+			"https://www.googleapis.com/auth/userinfo.email",
+			"https://www.googleapis.com/auth/userinfo.profile",
+		},
+		Endpoint: google.Endpoint,
 	}
 }
 
-func (h *Handler) indexHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		html := `<html>
-	<head><title>Golang Auth Service</title></head>
+func New() *http.ServeMux {
+	mux := http.NewServeMux()
+
+	// Public routes
+	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/signup", handleSignup)        // GET/POST
+	mux.HandleFunc("/login-form", handleLoginForm) // GET
+	mux.HandleFunc("/login", handleLogin)          // POST
+	mux.HandleFunc("/auth/google", handleGoogleLogin)
+	mux.HandleFunc("/auth/google/callback", handleGoogleCallback)
+
+	// Protected routes (JWT middleware)
+	mux.Handle("/profile", jwtMiddleware(http.HandlerFunc(handleProfile)))
+	mux.Handle("/logout", jwtMiddleware(http.HandlerFunc(handleLogout)))
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	fmt.Printf("Server running on port %s...\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, mux))
+
+	return mux
+}
+
+// -------------------------------------------------------------------
+// HANDLERS
+// -------------------------------------------------------------------
+
+func handleIndex(w http.ResponseWriter, r *http.Request) {
+	html := `<html>
+	<head><title>Golang Auth (NoSQL & JWT)</title></head>
 	<body>
-		<h1>Golang Auth (JWT + Google OAuth2)</h1>
-		<p><a href="/login">Local Login</a> | <a href="/signup">Signup</a> | <a href="/auth/login/google">Login with Google</a></p>
+		<h1>Welcome to the Golang Auth Service (MongoDB + JWT + Google OAuth)</h1>
+		<ul>
+			<li><a href="/login-form">Local Login</a></li>
+			<li><a href="/signup">Signup</a></li>
+			<li><a href="/auth/google">Login with Google</a></li>
+		</ul>
 	</body>
 	</html>`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, html)
+}
+
+// handleSignup - GET form or POST to create a new user
+func handleSignup(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		html := `<html>
+			<head><title>Sign Up</title></head>
+			<body>
+				<h1>Sign Up</h1>
+				<form method="POST" action="/signup">
+					<label>Email:</label><br>
+					<input type="email" name="email" required><br><br>
+					<label>Password:</label><br>
+					<input type="password" name="password" required><br><br>
+					<button type="submit">Sign Up</button>
+				</form>
+			</body>
+			</html>`
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, html)
-	}
-}
+		return
 
-// Initialize the global configuration variable
-func init() {
-	cfg = config.Load()
-}
+	case http.MethodPost:
+		email := strings.ToLower(r.FormValue("email"))
+		password := r.FormValue("password")
 
-// New creates and configures a new handler
-func New() http.Handler {
-	sm := NewSessionManager()
+		if email == "" || password == "" {
+			http.Error(w, "Invalid email or password", http.StatusBadRequest)
+			return
+		}
 
-	h := &Handler{
-		sm: sm,
-	}
+		// Check if user already exists
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	r := mux.NewRouter()
-	r.HandleFunc("/", h.logRequest(h.indexHandler())).Methods("GET")
-	r.HandleFunc("/logout", h.logRequest(h.logoutHandler())).Methods("GET")
-	r.HandleFunc("/signup", h.logRequest(h.signUpHandler())).Methods("GET", "POST")
-	r.HandleFunc("/console", h.logRequest(h.consoleHandler())).Methods("GET")
+		var existing User
+		err := userCollection.FindOne(ctx, bson.M{"email": email}).Decode(&existing)
+		if err == nil {
+			// means user found
+			http.Error(w, "User already exists", http.StatusConflict)
+			return
+		}
 
-	// Protected routes
-	login := r.PathPrefix("/auth").Subrouter()
-	login.HandleFunc("/login", h.logRequest(loginPage)).Methods("GET")
-	login.HandleFunc("/login", h.logRequest(h.loginHandler())).Methods("POST")
-	login.HandleFunc("/login/google", h.logRequest(h.googleLoginHandler())).Methods("GET")
-	login.HandleFunc("/login/google/callback", h.logRequest(h.googleCallbackHandler())).Methods("GET")
-
-	protected := r.PathPrefix("/console").Subrouter()
-	protected.Use(sm.SessionMiddleware)
-	r.HandleFunc("", h.logRequest(h.consoleHandler())).Methods("GET")
-
-	return r
-}
-
-// SessionManager structure handles session operations
-type SessionManager struct {
-	users    map[string]models.User
-	sessions map[string]string
-	logger   *logrus.Logger
-}
-
-// NewSessionManager initializes a SessionManager
-func NewSessionManager() *SessionManager {
-	logger := logrus.New()
-	logger.SetFormatter(&logrus.JSONFormatter{})
-	return &SessionManager{
-		users:    make(map[string]models.User),
-		sessions: make(map[string]string),
-		logger:   logger,
-	}
-}
-
-// Middleware to log requests
-func (h *Handler) logRequest(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		h.sm.logger.WithFields(logrus.Fields{
-			"method": r.Method,
-			"path":   r.URL.Path,
-		}).Info("Request received")
-		next.ServeHTTP(w, r)
-	}
-}
-
-// Home handler for protected routes
-func (h *Handler) consoleHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("session_token")
+		hashedPass, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if err != nil {
-			h.sm.logger.WithError(err).Error("Failed to get session cookie")
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			http.Error(w, "Failed to hash password", http.StatusInternalServerError)
 			return
 		}
 
-		user, err := h.sm.GetUserFromJWTToken(cookie.Value)
+		newUser := User{
+			Email:    email,
+			Password: string(hashedPass),
+		}
+
+		_, err = userCollection.InsertOne(ctx, newUser)
 		if err != nil {
-			h.sm.logger.WithError(err).Error("Failed to get user from token")
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			http.Error(w, "Failed to create user", http.StatusInternalServerError)
 			return
 		}
 
-		w.Write([]byte(fmt.Sprintf("Welcome, %s!", user.Name)))
+		http.Redirect(w, r, "/login-form", http.StatusSeeOther)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// LoginHandler authenticates user credentials
-func (h *Handler) loginHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var creds models.Credentials
-
-		creds.Email = r.FormValue("username")
-		creds.Password = r.FormValue("password")
-		if creds.Email == "" || creds.Password == "" {
-			h.sm.logger.WithError(errors.New("failed to decode credentials"))
-			http.Error(w, "Invalid request", http.StatusBadRequest)
-			return
-		}
-
-		user, exists := h.sm.users[creds.Email]
-		if !exists || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(creds.Password)) != nil {
-			h.sm.logger.WithField("email", creds.Email).Warn("Invalid credentials")
-			http.Error(w, ErrInvalidCredentials.Error(), http.StatusUnauthorized)
-			return
-		}
-
-		token, err := h.sm.generateJWTToken(user)
-		if err != nil {
-			h.sm.logger.WithError(err).Error("Failed to generate token")
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		h.sm.setSessionCookie(w, token)
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(models.LoginResponse{Token: token, User: user}); err != nil {
-			h.sm.logger.WithError(err).Error("Failed to encode response")
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-	}
+// handleLoginForm - GET login form
+func handleLoginForm(w http.ResponseWriter, r *http.Request) {
+	html := `<html>
+	<head><title>Login</title></head>
+	<body>
+		<h1>Local Login</h1>
+		<form method="POST" action="/login">
+			<label>Email:</label><br>
+			<input type="email" name="email" required><br><br>
+			<label>Password:</label><br>
+			<input type="password" name="password" required><br><br>
+			<button type="submit">Login</button>
+		</form>
+		<p><a href="/signup">Sign Up</a> | <a href="/auth/google">Login with Google</a></p>
+	</body>
+	</html>`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, html)
 }
 
-// // SignUpHandler registers a new user
-// func (h *Handler) signUpHandler() http.HandlerFunc {
-// 	return func(w http.ResponseWriter, r *http.Request) {
-// 		var newUser models.User
-// 		if err := json.NewDecoder(r.Body).Decode(&newUser); err != nil {
-// 			h.sm.logger.WithError(err).Error("Failed to decode user data")
-// 			http.Error(w, "Invalid request", http.StatusBadRequest)
-// 			return
-// 		}
+// handleLogin - POST local login
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-// 		if _, exists := h.sm.users[newUser.Email]; exists {
-// 			h.sm.logger.WithField("email", newUser.Email).Warn("Email already exists")
-// 			http.Error(w, "Email already registered", http.StatusConflict)
-// 			return
-// 		}
+	email := strings.ToLower(r.FormValue("email"))
+	password := r.FormValue("password")
 
-// 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.PasswordHash), bcrypt.DefaultCost)
-// 		if err != nil {
-// 			h.sm.logger.WithError(err).Error("Failed to hash password")
-// 			http.Error(w, "Internal server error", http.StatusInternalServerError)
-// 			return
-// 		}
+	if email == "" || password == "" {
+		http.Error(w, "Invalid email or password", http.StatusBadRequest)
+		return
+	}
 
-// 		newUser.PasswordHash = string(hashedPassword)
-// 		h.sm.users[newUser.Email] = newUser
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-// 		w.WriteHeader(http.StatusCreated)
-// 		json.NewEncoder(w).Encode(newUser)
-// 	}
-// }
+	var user User
+	err := userCollection.FindOne(ctx, bson.M{"email": email}).Decode(&user)
+	if err != nil {
+		http.Error(w, "User not found", http.StatusUnauthorized)
+		return
+	}
 
-// LogoutHandler clears the user session
-func (h *Handler) logoutHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("session_token")
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password)); err != nil {
+		http.Error(w, "Incorrect password", http.StatusUnauthorized)
+		return
+	}
+
+	// Generate JWT
+	tokenString, err := createJWTToken(user.Email)
+	if err != nil {
+		http.Error(w, "Failed to create token", http.StatusInternalServerError)
+		return
+	}
+
+	// Set JWT as an HTTP-only cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "jwt_token",
+		Value:    tokenString,
+		HttpOnly: true,
+		Path:     "/",
+		Expires:  time.Now().Add(24 * time.Hour),
+	})
+	http.Redirect(w, r, "/profile", http.StatusSeeOther)
+}
+
+// handleGoogleLogin - initiates Google OAuth2 login
+func handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
+	url := googleOauthConfig.AuthCodeURL(oauthStateString, oauth2.AccessTypeOffline)
+	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+}
+
+// handleGoogleCallback - OAuth2 callback from Google
+func handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
+	state := r.FormValue("state")
+	if state != oauthStateString {
+		http.Error(w, "Invalid OAuth state", http.StatusBadRequest)
+		return
+	}
+
+	code := r.FormValue("code")
+	if code == "" {
+		http.Error(w, "Code not found", http.StatusBadRequest)
+		return
+	}
+
+	token, err := googleOauthConfig.Exchange(context.Background(), code)
+	if err != nil {
+		http.Error(w, "Failed to exchange code: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	client := googleOauthConfig.Client(context.Background(), token)
+	userInfo, err := fetchGoogleUserInfo(client)
+	if err != nil {
+		http.Error(w, "Failed to fetch user info: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var googleData struct {
+		ID    string `json:"id"`
+		Email string `json:"email"`
+	}
+
+	if err := json.Unmarshal([]byte(userInfo), &googleData); err != nil {
+		http.Error(w, "Failed to parse user info", http.StatusInternalServerError)
+		return
+	}
+	if googleData.Email == "" {
+		http.Error(w, "No email found in Google profile", http.StatusInternalServerError)
+		return
+	}
+
+	// Check if user exists, if not create
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var user User
+	err = userCollection.FindOne(ctx, bson.M{"email": strings.ToLower(googleData.Email)}).Decode(&user)
+	if err != nil {
+		// means user doesn't exist, create new one
+		user = User{
+			Email:    strings.ToLower(googleData.Email),
+			Password: "", // login not used locally
+			GoogleID: googleData.ID,
+		}
+		_, err = userCollection.InsertOne(ctx, user)
 		if err != nil {
-			http.Error(w, "No session found", http.StatusBadRequest)
+			http.Error(w, "Failed to create user", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// If user exists but no GoogleID, update
+		if user.GoogleID == "" {
+			user.GoogleID = googleData.ID
+			_, _ = userCollection.UpdateOne(ctx, bson.M{"_id": user.ID}, bson.M{"$set": bson.M{"googleId": googleData.ID}})
+		}
+	}
+
+	tokenString, err := createJWTToken(googleData.Email)
+	if err != nil {
+		http.Error(w, "Failed to create token", http.StatusInternalServerError)
+		return
+	}
+
+	// Set JWT cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "jwt_token",
+		Value:    tokenString,
+		HttpOnly: true,
+		Path:     "/",
+		Expires:  time.Now().Add(24 * time.Hour),
+	})
+	http.Redirect(w, r, "/profile", http.StatusSeeOther)
+}
+
+// handleProfile - JWT-protected route
+func handleProfile(w http.ResponseWriter, r *http.Request) {
+	userEmail := r.Context().Value("user_email").(string)
+
+	// Retrieve the user from DB
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var user User
+	if err := userCollection.FindOne(ctx, bson.M{"email": userEmail}).Decode(&user); err != nil {
+		http.Error(w, "User not found", http.StatusNotFound)
+		return
+	}
+
+	html := `<html>
+	<head><title>Profile</title></head>
+	<body>
+		<h1>User Profile</h1>
+		<p>Email: ` + user.Email + `</p>
+		<p>GoogleID: ` + user.GoogleID + `</p>
+		<a href="/logout">Logout</a>
+	</body>
+	</html>`
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, html)
+}
+
+// handleLogout - JWT-protected route
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Invalidate the cookie by setting an expired cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:    "jwt_token",
+		Value:   "",
+		Expires: time.Unix(0, 0),
+		Path:    "/",
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// -------------------------------------------------------------------
+// MIDDLEWARE
+// -------------------------------------------------------------------
+
+func jwtMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie("jwt_token")
+		if err != nil || cookie.Value == "" {
+			http.Redirect(w, r, "/login-form", http.StatusSeeOther)
 			return
 		}
 
-		delete(h.sm.sessions, cookie.Value)
-
-		http.SetCookie(w, &http.Cookie{
-			Name:     "session_token",
-			Value:    "",
-			Path:     "/",
-			MaxAge:   -1,
-			HttpOnly: true,
-			Secure:   true,
-			SameSite: http.SameSiteStrictMode,
+		claims := &jwt.RegisteredClaims{}
+		token, err := jwt.ParseWithClaims(cookie.Value, claims, func(t *jwt.Token) (interface{}, error) {
+			return jwtSecret, nil
 		})
 
-		w.WriteHeader(http.StatusOK)
-	}
-}
-
-// Generate a JWT token for a user
-func (sm *SessionManager) generateJWTToken(user models.User) (string, error) {
-	logrus.WithField("email", user.Email).Info("Generating JWT token")
-	claims := jwt.MapClaims{
-		"email": user.Email,
-		"name":  user.Name,
-		"exp":   time.Now().Add(72 * time.Hour).Unix(),
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(cfg.JWTSecretKey))
-}
-
-// DecryptJWT decrypts the JWT token and returns the user
-func (sm *SessionManager) GetUserFromJWTToken(tokenString string) (models.User, error) {
-	claims, err := sm.validateToken(tokenString)
-	if err != nil {
-		return models.User{}, err
-	}
-
-	email, ok := claims["email"].(string)
-	if !ok {
-		return models.User{}, ErrInvalidToken
-	}
-
-	user, exists := sm.users[email]
-	if !exists {
-		return models.User{}, ErrUserNotFound
-	}
-
-	return user, nil
-}
-
-// Set the session cookie
-func (sm *SessionManager) setSessionCookie(w http.ResponseWriter, token string) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session_token",
-		Value:    token,
-		Path:     "/",
-		MaxAge:   int(12 * time.Hour.Seconds()),
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-	})
-}
-
-// Validate JWT token and extract claims
-func (sm *SessionManager) validateToken(tokenString string) (jwt.MapClaims, error) {
-	token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
-		return []byte(cfg.JWTSecretKey), nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("token parsing error: %w", err)
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok || !token.Valid {
-		return nil, ErrInvalidToken
-	}
-
-	return claims, nil
-}
-
-// Retrieve user from context
-func GetUserFromContext(ctx context.Context) (models.User, error) {
-	user, ok := ctx.Value(CtxUserKey).(models.User)
-	if !ok {
-		return models.User{}, ErrUserNotFound
-	}
-	return user, nil
-}
-
-// GoogleLoginHandler initiates OAuth flow
-func (h *Handler) googleLoginHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		url := cfg.GoogleOAuthConfig.AuthCodeURL(cfg.OAuthStateString)
-		http.Redirect(w, r, url, http.StatusTemporaryRedirect)
-	}
-}
-
-// GoogleCallbackHandler handles OAuth callback
-func (h *Handler) googleCallbackHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		state := r.FormValue("state")
-		if state != cfg.OAuthStateString {
-			h.sm.logger.Error("Invalid OAuth state")
-			http.Error(w, "Invalid OAuth state", http.StatusBadRequest)
+		if err != nil || !token.Valid {
+			http.Redirect(w, r, "/login-form", http.StatusSeeOther)
 			return
 		}
 
-		code := r.FormValue("code")
-		token, err := cfg.GoogleOAuthConfig.Exchange(r.Context(), code)
-		if err != nil {
-			h.sm.logger.WithError(err).Error("Code exchange failed")
-			http.Error(w, "Failed to complete OAuth flow", http.StatusInternalServerError)
+		if claims.Subject == "" {
+			http.Redirect(w, r, "/login-form", http.StatusSeeOther)
 			return
 		}
 
-		userInfo, err := h.sm.getGoogleUserInfo(token)
-		if err != nil {
-			h.sm.logger.WithError(err).Error("Failed to get user info")
-			http.Error(w, "Failed to get user info", http.StatusInternalServerError)
-			return
-		}
-
-		user, jwtToken, err := h.sm.handleGoogleUser(userInfo)
-		if err != nil {
-			h.sm.logger.WithError(err).Error("Failed to handle Google user")
-			http.Error(w, "Authentication failed", http.StatusInternalServerError)
-			return
-		}
-
-		h.sm.setSessionCookie(w, jwtToken)
-
-		// Add the user to the request context and redirect to the console
-		ctx := context.WithValue(r.Context(), CtxUserKey, user)
-		http.Redirect(w, r.WithContext(ctx), "/console", http.StatusTemporaryRedirect)
-	}
-}
-
-func CreateUserContext(context context.Context, user models.User) any {
-	panic("unimplemented")
-}
-
-func (sm *SessionManager) SessionMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("session_token")
-		if err != nil {
-			// If no session token exists, allow the request to proceed
-			logrus.Warn("No session token found")
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		claims, err := sm.validateToken(cookie.Value)
-		if err != nil {
-			// If the token is invalid, allow the request to proceed
-			sm.logger.WithError(err).Warn("Invalid token")
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		email, ok := claims["email"].(string)
-		if !ok {
-			// If the token doesn't contain the email claim, allow the request to proceed
-			sm.logger.Warn("Email claim missing")
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		user, exists := sm.users[email]
-		if !exists {
-			// If the user doesn't exist, allow the request to proceed
-			sm.logger.WithField("email", email).Warn("User not found")
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Add the user to the request context and allow the request to proceed
-		logrus.WithField("email", email).Info("Adding user to context")
-		ctx := context.WithValue(r.Context(), CtxUserKey, user)
-
-		// // // Redirect authenticated users to /console if they try to access public routes
-		// if r.URL.Path == "/login" || r.URL.Path == "/login/google" || r.URL.Path == "/login/google/callback" {
-		// 	http.Redirect(w, r.WithContext(ctx), "/console", http.StatusTemporaryRedirect)
-		// 	return
-		// }
-
+		ctx := context.WithValue(r.Context(), "user_email", claims.Subject)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func (sm *SessionManager) getGoogleUserInfo(token *oauth2.Token) (*models.GoogleUserInfo, error) {
-	userInfoAPIEndpoint := "https://www.googleapis.com/oauth2/v2/userinfo"
+// -------------------------------------------------------------------
+// HELPER FUNCTIONS
+// -------------------------------------------------------------------
 
-	client := cfg.GoogleOAuthConfig.Client(context.Background(), token)
-	resp, err := client.Get(userInfoAPIEndpoint)
+func fetchGoogleUserInfo(client *http.Client) (string, error) {
+	resp, err := client.Get("https://www.googleapis.com/oauth2/v2/userinfo")
 	if err != nil {
-		return nil, fmt.Errorf("failed to get user info: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// It's safer to read in streaming fashion with io.ReadAll(resp.Body)
+	// We'll do a quick approach here
+	data := make([]byte, resp.ContentLength)
+	_, err = resp.Body.Read(data)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return "", err
 	}
-
-	userInfo := models.GoogleUserInfo{}
-	if err := json.Unmarshal(body, &userInfo); err != nil {
-		return nil, fmt.Errorf("failed to decode user info: %w", err)
-	}
-
-	return &userInfo, nil
+	return string(data), nil
 }
 
-// Add helper method for handling Google users:
-func (sm *SessionManager) handleGoogleUser(userInfo *models.GoogleUserInfo) (models.User, string, error) {
-	user, exists := sm.users[userInfo.Email]
-	if !exists {
-		user = models.User{
-			Username:      userInfo.Email,
-			Email:         userInfo.Email,
-			Name:          userInfo.Name,
-			PasswordHash:  "",
-			VerifiedEmail: userInfo.VerifiedEmail,
-		}
-		if err := sm.CreateUser(user); err != nil {
-			return models.User{}, "", fmt.Errorf("creating user: %w", err)
-		}
+// createJWTToken - builds a JWT token with user email as 'sub' claim
+func createJWTToken(userEmail string) (string, error) {
+	claims := &jwt.RegisteredClaims{
+		Subject:   userEmail,
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		Issuer:    "golang-nosql-jwt",
 	}
-
-	token, err := sm.generateJWTToken(user)
-	if err != nil {
-		return models.User{}, "", fmt.Errorf("generating token: %w", err)
-	}
-
-	sm.sessions[token] = user.Email
-	return user, token, nil
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtSecret)
 }
 
-// CreateUser creates a new user and stores it in the session manager
-func (sm *SessionManager) CreateUser(newUser models.User) error {
-
-	if newUser.PasswordHash != "" {
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newUser.PasswordHash), bcrypt.DefaultCost)
-		if err != nil {
-			return fmt.Errorf("failed to hash password: %w", err)
-		}
-		newUser.PasswordHash = string(hashedPassword)
-	}
-
-	sm.users[newUser.Email] = newUser
-	return nil
+// generateRandomString - random string for OAuth2 state or any other usage
+func generateRandomString(length int) string {
+	b := make([]byte, length)
+	_, _ = rand.Read(b)
+	return base64.URLEncoding.EncodeToString(b)
 }
